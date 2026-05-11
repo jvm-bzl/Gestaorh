@@ -493,9 +493,74 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;heigh
 
 <script>
 // ══════════════════════════════════════════
+// SUPABASE CONFIG
+// ══════════════════════════════════════════
+const SUPA_URL = 'https://oyhngxqhidicpgyxlurz.supabase.co';
+const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im95aG5neHFoaWRpY3BneXhsdXJ6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzg1MDIwNTEsImV4cCI6MjA5NDA3ODA1MX0.8XTKdywvEugZ8L1GZgrh_HsZvV9Ptv9fi2jpKRwSAjI';
+
+const supa = {
+  async req(method, path, body){
+    const headers = {
+      'Content-Type': 'application/json',
+      'apikey': SUPA_KEY,
+      'Authorization': `Bearer ${window._supaToken || SUPA_KEY}`,
+      'Prefer': method === 'POST' ? 'return=representation' : undefined
+    };
+    Object.keys(headers).forEach(k => headers[k] === undefined && delete headers[k]);
+    const r = await fetch(SUPA_URL + path, { method, headers, body: body ? JSON.stringify(body) : undefined });
+    if(!r.ok){ const e = await r.text(); throw new Error(e); }
+    const txt = await r.text();
+    return txt ? JSON.parse(txt) : null;
+  },
+  get: (path) => supa.req('GET', path),
+  post: (path, body) => supa.req('POST', path, body),
+  patch: (path, body) => supa.req('PATCH', path, body),
+  delete: (path) => supa.req('DELETE', path),
+
+  // Supabase Auth
+  async signIn(username, password){
+    // Use custom usuarios table auth (bcrypt via RPC)
+    const r = await fetch(`${SUPA_URL}/rest/v1/rpc/autenticar_usuario`, {
+      method:'POST',
+      headers:{'Content-Type':'application/json','apikey':SUPA_KEY,'Authorization':`Bearer ${SUPA_KEY}`},
+      body: JSON.stringify({p_username: username, p_senha: password})
+    });
+    if(!r.ok) return null;
+    const data = await r.json();
+    return data;
+  },
+
+  // Upload PDF to storage
+  async uploadPDF(candidatoId, file){
+    const path = `${candidatoId}/${Date.now()}_curriculo.pdf`;
+    const r = await fetch(`${SUPA_URL}/storage/v1/object/curriculos/${path}`, {
+      method:'POST',
+      headers:{
+        'apikey': SUPA_KEY,
+        'Authorization': `Bearer ${window._supaToken || SUPA_KEY}`,
+        'Content-Type': 'application/pdf'
+      },
+      body: file
+    });
+    if(!r.ok) return null;
+    return path;
+  },
+
+  async getPDFUrl(path){
+    const r = await fetch(`${SUPA_URL}/storage/v1/object/sign/curriculos/${path}`, {
+      method:'POST',
+      headers:{'Content-Type':'application/json','apikey':SUPA_KEY,'Authorization':`Bearer ${window._supaToken || SUPA_KEY}`},
+      body: JSON.stringify({expiresIn: 3600})
+    });
+    if(!r.ok) return null;
+    const d = await r.json();
+    return d.signedURL ? `${SUPA_URL}/storage/v1${d.signedURL}` : null;
+  }
+};
+
+// ══════════════════════════════════════════
 // CONSTANTS
 // ══════════════════════════════════════════
-const USERS={admin:'admin123',rh:'rh2024'};
 const STATUS_MAP={'Em análise':'analise','Contratado':'contratado','Desligado':'desligado'};
 const COLORS=['#4f8ef7','#7c5cfc','#00d4aa','#f5a623','#f25c7a','#5cd9f2','#a8f55c'];
 const UFS=['AC','AL','AP','AM','BA','CE','DF','ES','GO','MA','MT','MS','MG','PA','PB','PR','PE','PI','RJ','RN','RS','RO','RR','SC','SP','SE','TO'];
@@ -514,7 +579,6 @@ const SURVEY_QUESTIONS=[
   {type:'open',title:'Como você avalia o impacto deste colaborador na equipe e nos resultados?',key:'impacto'},
 ];
 const LIKERT_LABELS=['Raramente','Às Vezes','Frequentemente','Muito Freq.','Não Sei'];
-const LIKERT_SCORES=[0,1,2,3,null]; // "Não Sei" = null (ignorado)
 
 // ══════════════════════════════════════════
 // STATE
@@ -524,38 +588,153 @@ let currentSkills=[];
 let editSkills=[];
 let surveyState={qIdx:0,respostas:{},candidateId:null,token:null,tipo:null};
 let radarChartInstance=null;
+let currentUser=null;
+window._pdfFile=null;
+window._pdfDataUrl=null;
 
-function loadCandidates(){try{candidates=JSON.parse(localStorage.getItem('tb_v5')||'[]');}catch{candidates=[];}}
-function saveCandidates(){localStorage.setItem('tb_v5',JSON.stringify(candidates));}
-loadCandidates();
+// ══════════════════════════════════════════
+// DB HELPERS — mapeia row DB ↔ objeto app
+// ══════════════════════════════════════════
+function dbRowToCandidate(row, historico=[], assessments=[]){
+  return {
+    id: row.id,
+    nome: row.nome,
+    email: row.email||'',
+    nascimento: row.nascimento||'',
+    sexo: row.sexo||'',
+    estadoCivil: row.estado_civil||'',
+    pcd: row.pcd ? 'Sim' : 'Não',
+    cnh: row.cnh||'Não possui',
+    linkedin: row.linkedin||'',
+    cidade: row.cidade||'',
+    estado: row.estado||'',
+    formacao: row.formacao||'',
+    vaga: row.vaga_pretendida||'',
+    experiencia: row.experiencia||'',
+    skills: row.skills||[],
+    contrato: row.tipo_contrato||[],
+    status: row.status||'Em análise',
+    nota_avaliacao: row.nota_avaliacao,
+    pdf_path: row.pdf_path||null,
+    pdfDataUrl: null,
+    createdAt: row.criado_em,
+    historico,
+    assessments
+  };
+}
+
+function candidateToDbRow(c){
+  return {
+    nome: c.nome,
+    email: c.email||null,
+    nascimento: c.nascimento||null,
+    sexo: c.sexo||null,
+    estado_civil: c.estadoCivil||null,
+    pcd: c.pcd==='Sim',
+    cnh: c.cnh||'Não possui',
+    linkedin: c.linkedin||null,
+    cidade: c.cidade||null,
+    estado: c.estado||null,
+    formacao: c.formacao||null,
+    vaga_pretendida: c.vaga||null,
+    experiencia: c.experiencia||null,
+    skills: c.skills||[],
+    tipo_contrato: c.contrato||[],
+    status: c.status||'Em análise'
+  };
+}
+
+// ══════════════════════════════════════════
+// LOAD DATA FROM SUPABASE
+// ══════════════════════════════════════════
+async function loadCandidates(){
+  showLoading(true);
+  try {
+    const [rows, historicos, avaliacoes, likerts, abertas] = await Promise.all([
+      supa.get('/rest/v1/candidatos?select=*&order=criado_em.desc'),
+      supa.get('/rest/v1/historico_status?select=*&order=data_evento.asc'),
+      supa.get('/rest/v1/avaliacoes?select=*'),
+      supa.get('/rest/v1/respostas_likert?select=*'),
+      supa.get('/rest/v1/respostas_abertas?select=*'),
+    ]);
+
+    candidates = (rows||[]).map(row => {
+      const hist = (historicos||[])
+        .filter(h => h.candidato_id === row.id)
+        .map(h => ({ status: h.status, data: h.data_evento, obs: h.observacoes||'' }));
+
+      const avs = (avaliacoes||[])
+        .filter(a => a.candidato_id === row.id)
+        .map(a => {
+          // Build respostas object
+          const respostas = {};
+          // Likert
+          const lks = (likerts||[]).filter(l => l.avaliacao_id === a.id);
+          SURVEY_QUESTIONS.filter(q=>q.type==='likert').forEach(q => {
+            const items = lks.filter(l => l.competencia === q.competencia).sort((x,y)=>x.item_index-y.item_index);
+            if(items.length) respostas[q.competencia] = items.map(i => i.valor);
+          });
+          // Open
+          (abertas||[]).filter(ab => ab.avaliacao_id === a.id).forEach(ab => {
+            respostas[ab.chave] = ab.resposta||'';
+          });
+          return {
+            id: a.id,
+            tipo: a.tipo,
+            token: a.token,
+            respondido: a.respondido,
+            respostas: a.respondido ? respostas : null,
+            dataResposta: a.data_resposta
+          };
+        });
+
+      return dbRowToCandidate(row, hist, avs);
+    });
+  } catch(e) {
+    console.error('Erro ao carregar candidatos:', e);
+    showToast('error','❌ Erro ao carregar dados do servidor');
+    candidates = [];
+  }
+  showLoading(false);
+}
+
+function showLoading(on){
+  let el = document.getElementById('global-loading');
+  if(!el){
+    el = document.createElement('div');
+    el.id = 'global-loading';
+    el.style.cssText = 'position:fixed;top:0;left:0;right:0;height:3px;background:linear-gradient(90deg,var(--accent),var(--accent2));z-index:9999;transition:opacity .3s;';
+    el.innerHTML = '<div style="height:100%;background:linear-gradient(90deg,transparent,rgba(255,255,255,.4),transparent);animation:shimmer 1s infinite;"></div>';
+    document.body.appendChild(el);
+    const style = document.createElement('style');
+    style.textContent = '@keyframes shimmer{0%{transform:translateX(-100%)}100%{transform:translateX(400%)}}';
+    document.head.appendChild(style);
+  }
+  el.style.opacity = on ? '1' : '0';
+}
 
 // ══════════════════════════════════════════
 // SCORE CALCULATION (70% supervisor, 30% auto)
 // ══════════════════════════════════════════
 function calcLikertScore(respostas){
-  // respostas is an object: { competencia: [v0,v1,...] }
   let total=0,count=0;
   SURVEY_QUESTIONS.filter(q=>q.type==='likert').forEach(q=>{
     const vals=(respostas[q.competencia]||[]).filter(v=>v!==null&&v!==undefined&&v!==4);
     vals.forEach(v=>{total+=v;count++;});
   });
   if(!count) return 0;
-  // raw avg 0-3, scale to 0-10
   return +((total/count)*(10/3)).toFixed(1);
 }
-
 function calcCandidateScore(c){
+  if(c.nota_avaliacao!==null&&c.nota_avaliacao!==undefined) return +Number(c.nota_avaliacao).toFixed(1);
   const assessments=c.assessments||[];
   const autoA=assessments.find(a=>a.tipo==='auto'&&a.respondido&&a.respostas);
   const supA=assessments.find(a=>a.tipo==='supervisor'&&a.respondido&&a.respostas);
   if(!supA&&!autoA) return null;
   if(supA&&!autoA) return +calcLikertScore(supA.respostas).toFixed(1);
   if(autoA&&!supA) return +calcLikertScore(autoA.respostas).toFixed(1);
-  const autoScore=calcLikertScore(autoA.respostas);
-  const supScore=calcLikertScore(supA.respostas);
-  return +(autoScore*0.3+supScore*0.7).toFixed(1);
+  return +(calcLikertScore(autoA.respostas)*0.3+calcLikertScore(supA.respostas)*0.7).toFixed(1);
 }
-
 function scoreColor(s){
   if(s===null) return 'var(--text3)';
   if(s>=8) return 'var(--success)';
@@ -565,21 +744,44 @@ function scoreColor(s){
 }
 
 // ══════════════════════════════════════════
-// AUTH
+// AUTH — usa tabela usuarios + RPC bcrypt
 // ══════════════════════════════════════════
-function doLogin(){
+async function doLogin(){
   const u=document.getElementById('login-user').value.trim();
   const p=document.getElementById('login-pass').value;
-  if(USERS[u]&&USERS[u]===p){
-    document.getElementById('login-screen').classList.remove('active');
-    document.getElementById('app-screen').classList.add('active');
-    document.getElementById('user-avatar').textContent=u[0].toUpperCase();
-    document.getElementById('user-name').textContent=u[0].toUpperCase()+u.slice(1);
-    document.getElementById('login-error').style.display='none';
-    renderCandidates();renderEstadoFilter();renderSkillFilters();
-  } else document.getElementById('login-error').style.display='block';
+  const btn=document.querySelector('#login-screen .btn-primary');
+  btn.disabled=true; btn.textContent='Verificando...';
+  try{
+    // Chama RPC autenticar_usuario que valida bcrypt e retorna dados do user
+    const r = await fetch(`${SUPA_URL}/rest/v1/rpc/autenticar_usuario`,{
+      method:'POST',
+      headers:{'Content-Type':'application/json','apikey':SUPA_KEY,'Authorization':`Bearer ${SUPA_KEY}`},
+      body:JSON.stringify({p_username:u, p_senha:p})
+    });
+    const data = await r.json();
+    if(data && data.id){
+      currentUser = data;
+      window._supaToken = SUPA_KEY; // anon token para operações
+      document.getElementById('login-screen').classList.remove('active');
+      document.getElementById('app-screen').classList.add('active');
+      document.getElementById('user-avatar').textContent=data.nome_exibicao[0].toUpperCase();
+      document.getElementById('user-name').textContent=data.nome_exibicao;
+      document.getElementById('login-error').style.display='none';
+      await loadCandidates();
+      renderCandidates();renderEstadoFilter();renderSkillFilters();
+    } else {
+      document.getElementById('login-error').style.display='block';
+    }
+  } catch(e){
+    console.error(e);
+    document.getElementById('login-error').style.display='block';
+  }
+  btn.disabled=false; btn.textContent='Entrar na plataforma →';
 }
-function doLogout(){
+
+async function doLogout(){
+  currentUser=null;
+  candidates=[];
   document.getElementById('app-screen').classList.remove('active');
   document.getElementById('login-screen').classList.add('active');
   showPage('upload');resetForm();
@@ -606,6 +808,7 @@ zone.addEventListener('drop',e=>{e.preventDefault();zone.classList.remove('drago
 function handleFile(e){const f=e.target.files[0];if(f)processFile(f);}
 function processFile(file){
   if(!file.name.toLowerCase().endsWith('.pdf')){showToast('error','⚠️ Selecione um arquivo PDF');return;}
+  window._pdfFile = file;
   document.getElementById('upload-zone').style.display='none';
   document.getElementById('upload-status').style.display='block';
   document.getElementById('candidate-form').style.display='none';
@@ -660,34 +863,72 @@ function removeSkill(i){currentSkills.splice(i,1);renderSkillTags();}
 function toggleChk(el){setTimeout(()=>el.classList.toggle('checked',el.querySelector('input').checked),0);}
 
 // ══════════════════════════════════════════
-// SAVE
+// SAVE CANDIDATE → SUPABASE
 // ══════════════════════════════════════════
-function saveCandidate(){
+async function saveCandidate(){
   const nome=document.getElementById('f-nome').value.trim();
   if(!nome){showToast('error','⚠️ Preencha o nome do candidato');return;}
+  const btn=document.querySelector('#candidate-form .btn-primary');
+  btn.disabled=true;btn.textContent='Salvando...';
+
   const contrato=Array.from(document.querySelectorAll('#contrato-group input:checked')).map(i=>i.value);
-  const c={id:Date.now(),nome,email:document.getElementById('f-email').value.trim(),
+  const row = candidateToDbRow({
+    nome, email:document.getElementById('f-email').value.trim(),
     nascimento:document.getElementById('f-nascimento').value,
-    sexo:document.getElementById('f-sexo').value,estadoCivil:document.getElementById('f-ec').value,
-    pcd:document.getElementById('f-pcd').value,cnh:document.getElementById('f-cnh').value,
+    sexo:document.getElementById('f-sexo').value,
+    estadoCivil:document.getElementById('f-ec').value,
+    pcd:document.getElementById('f-pcd').value,
+    cnh:document.getElementById('f-cnh').value,
     linkedin:document.getElementById('f-linkedin').value.trim(),
-    cidade:document.getElementById('f-cidade').value.trim(),estado:document.getElementById('f-estado').value,
-    formacao:document.getElementById('f-formacao').value.trim(),vaga:document.getElementById('f-vaga').value.trim(),
+    cidade:document.getElementById('f-cidade').value.trim(),
+    estado:document.getElementById('f-estado').value,
+    formacao:document.getElementById('f-formacao').value.trim(),
+    vaga:document.getElementById('f-vaga').value.trim(),
     experiencia:document.getElementById('f-experiencia').value.trim(),
-    skills:[...currentSkills],contrato,status:'Em análise',
-    historico:[{status:'Em análise',data:new Date().toISOString(),obs:'Cadastro inicial na plataforma.'}],
-    assessments:[],createdAt:new Date().toISOString(),pdfDataUrl:window._pdfDataUrl||null};
-  candidates.push(c);saveCandidates();
-  showToast('success',`✅ ${nome} cadastrado(a) com sucesso!`);
-  setTimeout(()=>{resetForm();showPage('candidates');},1500);
+    skills:[...currentSkills], contrato, status:'Em análise'
+  });
+  if(currentUser?.id) row.criado_por = currentUser.id;
+
+  try{
+    // 1. Insert candidato
+    const [inserted] = await supa.post('/rest/v1/candidatos', row);
+
+    // 2. Upload PDF se houver
+    if(window._pdfFile && inserted.id){
+      const path = await supa.uploadPDF(inserted.id, window._pdfFile);
+      if(path){
+        await supa.patch(`/rest/v1/candidatos?id=eq.${inserted.id}`, {pdf_path: path});
+        inserted.pdf_path = path;
+      }
+    }
+
+    // 3. Histórico inicial
+    await supa.post('/rest/v1/historico_status', {
+      candidato_id: inserted.id,
+      status: 'Em análise',
+      data_evento: new Date().toISOString(),
+      observacoes: 'Cadastro inicial na plataforma.',
+      registrado_por: currentUser?.id||null
+    });
+
+    showToast('success',`✅ ${nome} cadastrado(a) com sucesso!`);
+    await loadCandidates();
+    setTimeout(()=>{resetForm();showPage('candidates');},1200);
+  } catch(e){
+    console.error(e);
+    showToast('error','❌ Erro ao salvar candidato. Verifique a conexão.');
+  }
+  btn.disabled=false;btn.textContent='💾 Salvar Candidato';
 }
+
 function resetForm(){
   document.getElementById('upload-zone').style.display='block';
   document.getElementById('upload-status').style.display='none';
   document.getElementById('candidate-form').style.display='none';
   document.getElementById('pdf-input').value='';currentSkills=[];
   document.querySelectorAll('#contrato-group .chk-opt').forEach(el=>{el.classList.remove('checked');el.querySelector('input').checked=false;});
-  document.getElementById('progress-fill').style.width='0%';window._pdfDataUrl=null;
+  document.getElementById('progress-fill').style.width='0%';
+  window._pdfFile=null;window._pdfDataUrl=null;
 }
 
 // ══════════════════════════════════════════
@@ -705,7 +946,7 @@ function renderCandidates(list){
   if(!list.length){grid.innerHTML=`<div class="no-cands"><div style="font-size:42px;margin-bottom:12px;">🔎</div><p>Nenhum candidato encontrado</p><p style="font-size:12px;margin-top:5px;">Ajuste os filtros ou cadastre um novo</p></div>`;return;}
   grid.innerHTML=list.map(c=>{
     const score=calcCandidateScore(c);
-    return `<div class="cand-card" onclick="openModal(${c.id})">
+    return `<div class="cand-card" onclick="openModal('${c.id}')">
       <span class="sp sp-${scls(c.status)}">${c.status||'Em análise'}</span>
       ${score!==null?`<span class="score-badge" style="color:${scoreColor(score)}">⭐ ${score}</span>`:''}
       <div class="cand-card-top">
@@ -728,13 +969,11 @@ function renderCandidates(list){
 // FILTERS
 // ══════════════════════════════════════════
 function updateScoreSlider(el){
-  const v=parseFloat(el.value);
-  const pct=(v/10)*100;
+  const v=parseFloat(el.value);const pct=(v/10)*100;
   el.style.setProperty('--val',pct+'%');
   const disp=document.getElementById('f-score-display');
   disp.innerHTML=v===0?`Nota mínima: <strong>0.0</strong> — Todos`:`Nota mínima: <strong>${v.toFixed(1)}</strong>`;
 }
-// init slider
 updateScoreSlider(document.getElementById('f-score'));
 
 function getFiltered(){
@@ -754,16 +993,10 @@ function getFiltered(){
     if(sexoF&&c.sexo!==sexoF)return false;
     if(pcdF&&c.pcd!==pcdF)return false;
     if(contratoF&&!c.contrato?.includes(contratoF))return false;
-    if(cnhF){
-      if(cnhF==='possui'&&(!c.cnh||c.cnh==='Não possui'))return false;
-      else if(cnhF!=='possui'&&c.cnh!==cnhF)return false;
-    }
+    if(cnhF){if(cnhF==='possui'&&(!c.cnh||c.cnh==='Não possui'))return false;else if(cnhF!=='possui'&&c.cnh!==cnhF)return false;}
     if(estadoF&&c.estado!==estadoF)return false;
     if(skillF.length&&!skillF.every(sf=>c.skills?.some(sk=>sk.toLowerCase().includes(sf))))return false;
-    if(minScore>0){
-      const score=calcCandidateScore(c);
-      if(score===null||score<minScore)return false;
-    }
+    if(minScore>0){const score=calcCandidateScore(c);if(score===null||score<minScore)return false;}
     return true;
   });
 }
@@ -774,12 +1007,10 @@ function clearFilters(){
   });
   const sl=document.getElementById('f-score');sl.value=0;updateScoreSlider(sl);
   document.querySelectorAll('.skill-chip').forEach(c=>c.classList.remove('active'));
-  document.getElementById('search-input').value='';
-  renderCandidates();
+  document.getElementById('search-input').value='';renderCandidates();
 }
 function renderEstadoFilter(){
-  const sel=document.getElementById('f-estado-filter');
-  const cur=sel.value;
+  const sel=document.getElementById('f-estado-filter');const cur=sel.value;
   const estados=[...new Set(candidates.map(c=>c.estado).filter(Boolean))].sort();
   sel.innerHTML=`<option value="">Todos os estados</option>`+estados.map(e=>`<option value="${e}" ${cur===e?'selected':''}>${e}</option>`).join('');
 }
@@ -861,9 +1092,9 @@ function buildPerfil(c){
   <div style="display:flex;justify-content:space-between;align-items:center;margin-top:6px;flex-wrap:wrap;gap:8px;">
     <span style="font-size:11px;color:var(--text3);">Cadastrado: ${new Date(c.createdAt).toLocaleDateString('pt-BR')}</span>
     <div style="display:flex;gap:7px;flex-wrap:wrap;">
-      ${c.pdfDataUrl?`<button class="btn btn-sm btn-outline" onclick="switchTab('pdf')" style="font-size:11px;">📄 PDF</button>`:''}
+      ${c.pdf_path?`<button class="btn btn-sm btn-outline" onclick="switchTab('pdf')" style="font-size:11px;">📄 PDF</button>`:''}
       <button class="btn btn-sm btn-outline" onclick="switchTab('editar')" style="font-size:11px;color:var(--accent);border-color:var(--accent);">✏️ Editar</button>
-      <button class="btn btn-sm btn-danger" onclick="deleteCandidate(${c.id})" style="font-size:11px;">🗑 Excluir</button>
+      <button class="btn btn-sm btn-danger" onclick="deleteCandidate('${c.id}')" style="font-size:11px;">🗑 Excluir</button>
     </div>
   </div>`;}
 
@@ -879,7 +1110,7 @@ function buildStatus(c){return `
       <label>Observações</label>
       <textarea id="ns-obs" placeholder="Ex: Contratado como Analista Jr., início em 01/06..."></textarea>
       <div style="display:flex;justify-content:flex-end;margin-top:10px;">
-        <button class="btn btn-sm btn-primary" style="width:auto;" onclick="saveStatus(${c.id})">💾 Salvar</button>
+        <button class="btn btn-sm btn-primary" style="width:auto;" onclick="saveStatus('${c.id}')">💾 Salvar</button>
       </div>
     </div>
   </div>
@@ -896,17 +1127,23 @@ function buildStatus(c){return `
     </div>
   </div>`;}
 
-function saveStatus(id){
-  const idx=candidates.findIndex(x=>x.id===id);if(idx===-1)return;
+async function saveStatus(id){
   const ns=document.getElementById('ns-sel').value;
   const data=document.getElementById('ns-date').value;
   const obs=document.getElementById('ns-obs').value.trim();
-  candidates[idx].status=ns;
-  if(!candidates[idx].historico)candidates[idx].historico=[];
-  candidates[idx].historico.push({status:ns,data:data?new Date(data).toISOString():new Date().toISOString(),obs});
-  saveCandidates();renderCandidates();
-  showToast('success','📊 Status atualizado!');
-  switchTab('status');
+  try{
+    await Promise.all([
+      supa.patch(`/rest/v1/candidatos?id=eq.${id}`,{status:ns}),
+      supa.post('/rest/v1/historico_status',{
+        candidato_id:id, status:ns,
+        data_evento:data?new Date(data).toISOString():new Date().toISOString(),
+        observacoes:obs, registrado_por:currentUser?.id||null
+      })
+    ]);
+    await loadCandidates();
+    showToast('success','📊 Status atualizado!');
+    switchTab('status');
+  } catch(e){showToast('error','❌ Erro ao salvar status');}
 }
 
 // ── AVALIAÇÃO 360 TAB ──
@@ -923,47 +1160,33 @@ function buildAvaliacao(c){
     <h3 style="font-size:17px;font-weight:800;margin-bottom:5px;">🎯 Avaliação de Perfil 360°</h3>
     <p style="color:var(--text2);font-size:13px;">Respondido pelo colaborador (30%) e supervisor imediato (70%)</p>
   </div>
-
-  <div class="assess-how">
-    <h4>📋 Como funciona</h4>
-    <ol>
-      <li>Clique em <strong>"Gerar Códigos"</strong> abaixo.</li>
-      <li>Copie cada código e envie por e-mail para o colaborador e para o supervisor.</li>
-      <li>O avaliador abre o Gestão RH, clica em <strong>"🎯 Responder Avaliação"</strong> e digita o código.</li>
-      <li>Após ambos responderem, a nota e o Radar aparecem aqui automaticamente.</li>
-    </ol>
-  </div>
-
-  ${hasResults?`
-  <div class="score-display">
+  <div class="assess-how"><h4>📋 Como funciona</h4><ol>
+    <li>Clique em <strong>"Gerar Códigos"</strong> abaixo.</li>
+    <li>Copie cada código e envie por e-mail para o colaborador e para o supervisor.</li>
+    <li>O avaliador abre o Gestão RH, clica em <strong>"🎯 Responder Avaliação"</strong> e digita o código.</li>
+    <li>Após ambos responderem, a nota e o Radar aparecem aqui automaticamente.</li>
+  </ol></div>
+  ${hasResults?`<div class="score-display">
     <div class="score-big" style="color:${scoreColor(score)}">${score}</div>
-    <div class="score-details">
-      <h4>Nota Final da Avaliação</h4>
-      <p>Composição ponderada das respostas</p>
+    <div class="score-details"><h4>Nota Final da Avaliação</h4><p>Composição ponderada das respostas</p>
       <div class="score-breakdown">
         ${supScore!==null?`<span class="score-part score-part-sup">Supervisor: ${supScore} × 70%</span>`:''}
         ${autoScore!==null?`<span class="score-part score-part-auto">Auto: ${autoScore} × 30%</span>`:''}
       </div>
     </div>
   </div>`:''}
-
   <div style="display:flex;gap:8px;justify-content:center;margin:12px 0;flex-wrap:wrap;">
-    <button class="btn btn-sm btn-outline" onclick="generateLinks(${c.id})" style="color:var(--accent);border-color:var(--accent);">
+    <button class="btn btn-sm btn-outline" onclick="generateLinks('${c.id}')" style="color:var(--accent);border-color:var(--accent);">
       🔗 ${autoA?.token?'Regenerar Códigos':'Gerar Códigos de Avaliação'}
     </button>
-    ${autoA?.token?`<button class="btn btn-sm btn-danger" onclick="resetAssessment(${c.id})">🗑 Resetar</button>`:''}
-    ${hasResults?`<button class="btn btn-sm btn-report" onclick="generateReport(${c.id})">📄 Gerar Relatório PDF</button>`:''}
+    ${autoA?.token?`<button class="btn btn-sm btn-danger" onclick="resetAssessment('${c.id}')">🗑 Resetar</button>`:''}
+    ${hasResults?`<button class="btn btn-sm btn-report" onclick="generateReport('${c.id}')">📄 Gerar Relatório PDF</button>`:''}
   </div>
-
-  ${autoA?.token?`
-  <div class="assess-cards">
+  ${autoA?.token?`<div class="assess-cards">
     <div class="assess-card">
       <h4>👤 Autoavaliação <span style="font-size:10px;color:var(--text3);font-weight:400;">(peso 30%)</span></h4>
       <p>Envie este código para o <strong>próprio colaborador</strong></p>
-      <div class="code-box">
-        <span class="code-txt">${autoA.token}</span>
-        <button class="code-copy" onclick="copyCode('${autoA.token}')" title="Copiar">📋</button>
-      </div>
+      <div class="code-box"><span class="code-txt">${autoA.token}</span><button class="code-copy" onclick="copyCode('${autoA.token}')">📋</button></div>
       <div class="assess-status-row">
         <span class="assess-badge ${autoA?.respondido?'ab-done':'ab-pending'}">${autoA?.respondido?`✅ Respondido — ${autoScore?.toFixed(1)||'?'}/10`:'⏳ Aguardando'}</span>
         ${!autoA?.respondido?`<button class="open-form-btn" onclick="openSurveyDirect('${autoA.token}')">Abrir Formulário ↗</button>`:''}
@@ -972,19 +1195,14 @@ function buildAvaliacao(c){
     <div class="assess-card">
       <h4>👔 Supervisor <span style="font-size:10px;color:var(--text3);font-weight:400;">(peso 70%)</span></h4>
       <p>Envie este código para o <strong>supervisor imediato</strong></p>
-      <div class="code-box">
-        <span class="code-txt">${supA.token}</span>
-        <button class="code-copy" onclick="copyCode('${supA.token}')" title="Copiar">📋</button>
-      </div>
+      <div class="code-box"><span class="code-txt">${supA.token}</span><button class="code-copy" onclick="copyCode('${supA.token}')">📋</button></div>
       <div class="assess-status-row">
         <span class="assess-badge ${supA?.respondido?'ab-done':'ab-pending'}">${supA?.respondido?`✅ Respondido — ${supScore?.toFixed(1)||'?'}/10`:'⏳ Aguardando'}</span>
         ${!supA?.respondido?`<button class="open-form-btn" onclick="openSurveyDirect('${supA.token}')">Abrir Formulário ↗</button>`:''}
       </div>
     </div>
   </div>`:''}
-
-  ${hasResults?buildRadarAndResults(c):`
-  <div style="text-align:center;padding:28px 20px;color:var(--text3);">
+  ${hasResults?buildRadarAndResults(c):`<div style="text-align:center;padding:28px 20px;color:var(--text3);">
     <div style="font-size:36px;margin-bottom:10px;">📊</div>
     <p style="font-size:13px;">${autoA?.token?'O Radar aparecerá após <strong style="color:var(--text);">ambas</strong> as avaliações serem concluídas.':'Gere os códigos para iniciar a avaliação.'}</p>
   </div>`}
@@ -1009,33 +1227,19 @@ function buildRadarAndResults(c){
   </div>
   <div class="msec"><div class="msec-title">Pontuação por Competência</div>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
-      ${lqs.map(q=>{
-        const a=compScore(autoA?.respostas,q.competencia);
-        const s=compScore(supA?.respostas,q.competencia);
-        const w=+(a*0.3+s*0.7).toFixed(1);
+      ${lqs.map(q=>{const a=compScore(autoA?.respostas,q.competencia);const s=compScore(supA?.respostas,q.competencia);const w=+(a*0.3+s*0.7).toFixed(1);
         return `<div style="background:var(--bg3);border-radius:var(--rsm);padding:10px 12px;">
           <div style="font-size:11px;color:var(--text3);margin-bottom:4px;">${q.competencia}</div>
           <div style="font-size:18px;font-weight:800;font-family:'Syne',sans-serif;color:${scoreColor(w)}">${w}</div>
           <div style="font-size:10px;color:var(--text3);margin-top:2px;">Auto: ${a} | Sup: ${s}</div>
-        </div>`;
-      }).join('')}
+        </div>`;}).join('')}
     </div>
   </div>
   <div class="msec"><div class="msec-title">Respostas Abertas — Autoavaliação</div>
-    ${openQs.map(q=>autoA?.respostas?.[q.key]?`
-    <div class="open-answer-card">
-      <div class="qa-label">Autoavaliação</div>
-      <div class="qa-q">${q.title}</div>
-      <div class="qa-a">${autoA.respostas[q.key]}</div>
-    </div>`:'').join('')||'<p style="color:var(--text3);font-size:13px;">Sem respostas abertas.</p>'}
+    ${openQs.map(q=>autoA?.respostas?.[q.key]?`<div class="open-answer-card"><div class="qa-label">Autoavaliação</div><div class="qa-q">${q.title}</div><div class="qa-a">${autoA.respostas[q.key]}</div></div>`:'').join('')}
   </div>
   <div class="msec"><div class="msec-title">Respostas Abertas — Supervisor</div>
-    ${openQs.map(q=>supA?.respostas?.[q.key]?`
-    <div class="open-answer-card">
-      <div class="qa-label">Supervisor</div>
-      <div class="qa-q">${q.title}</div>
-      <div class="qa-a">${supA.respostas[q.key]}</div>
-    </div>`:'').join('')||'<p style="color:var(--text3);font-size:13px;">Sem respostas abertas.</p>'}
+    ${openQs.map(q=>supA?.respostas?.[q.key]?`<div class="open-answer-card"><div class="qa-label">Supervisor</div><div class="qa-q">${q.title}</div><div class="qa-a">${supA.respostas[q.key]}</div></div>`:'').join('')}
   </div>`;}
 
 function initRadar(c){
@@ -1046,10 +1250,7 @@ function initRadar(c){
     const canvas=document.getElementById('radar-chart');if(!canvas)return;
     canvas.style.display='block';
     const lqs=SURVEY_QUESTIONS.filter(q=>q.type==='likert');
-    const score=(resp,comp)=>{
-      const vals=(resp?.[comp]||[]).filter(v=>v!==null&&v!==undefined&&v!==4);
-      return vals.length?+(vals.reduce((a,b)=>a+b,0)/vals.length*(10/3)).toFixed(1):0;
-    };
+    const score=(resp,comp)=>{const vals=(resp?.[comp]||[]).filter(v=>v!==null&&v!==undefined&&v!==4);return vals.length?+(vals.reduce((a,b)=>a+b,0)/vals.length*(10/3)).toFixed(1):0;};
     if(radarChartInstance)radarChartInstance.destroy();
     radarChartInstance=new Chart(canvas,{type:'radar',
       data:{labels:lqs.map(q=>q.competencia.split(' ')),
@@ -1063,178 +1264,39 @@ function initRadar(c){
   },120);
 }
 
-// ── GENERATE PDF REPORT ──
-function generateReport(id){
-  const c=candidates.find(x=>x.id===id);if(!c)return;
-  const autoA=c.assessments?.find(a=>a.tipo==='auto');
-  const supA=c.assessments?.find(a=>a.tipo==='supervisor');
-  const score=calcCandidateScore(c);
-  const autoScore=autoA?.respostas?calcLikertScore(autoA.respostas):null;
-  const supScore=supA?.respostas?calcLikertScore(supA.respostas):null;
-  const lqs=SURVEY_QUESTIONS.filter(q=>q.type==='likert');
-  const openQs=SURVEY_QUESTIONS.filter(q=>q.type==='open');
-  const compScore=(resp,comp)=>{
-    const vals=(resp?.[comp]||[]).filter(v=>v!==null&&v!==undefined&&v!==4);
-    return vals.length?+(vals.reduce((a,b)=>a+b,0)/vals.length*(10/3)).toFixed(1):0;
-  };
-  const likertRow=(resp,comp)=>{
-    const q=SURVEY_QUESTIONS.find(x=>x.competencia===comp&&x.type==='likert');
-    if(!q||!resp)return'';
-    return q.items.map((item,ii)=>{
-      const v=resp[comp]?.[ii];
-      const lbl=v===null||v===undefined?'—':(v===4?'Não Sei':LIKERT_LABELS[v]||'—');
-      return `<tr><td style="padding:5px 8px;font-size:12px;color:#444;border-bottom:1px solid #eee;">${item}</td><td style="padding:5px 8px;font-size:12px;text-align:center;border-bottom:1px solid #eee;font-weight:600;">${lbl}</td></tr>`;
-    }).join('');
-  };
-
-  const html=`<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8">
-  <title>Relatório Avaliação 360° — ${c.nome}</title>
-  <style>
-    body{font-family:'Segoe UI',Arial,sans-serif;margin:0;padding:30px;color:#1a1a2e;background:#fff;font-size:13px;}
-    h1{font-size:22px;font-weight:800;margin-bottom:4px;color:#0a0e1a;}
-    h2{font-size:15px;font-weight:700;margin:20px 0 8px;color:#0a0e1a;border-left:4px solid #4f8ef7;padding-left:8px;}
-    h3{font-size:13px;font-weight:700;margin:14px 0 6px;color:#333;}
-    .header{background:linear-gradient(135deg,#4f8ef7,#7c5cfc);color:#fff;padding:20px 24px;border-radius:10px;margin-bottom:20px;}
-    .header h1{color:#fff;margin-bottom:3px;}
-    .header p{font-size:12px;opacity:.85;margin:0;}
-    .meta-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:18px;}
-    .meta-item{background:#f5f7ff;border-radius:6px;padding:8px 12px;}
-    .meta-item .lbl{font-size:10px;color:#666;text-transform:uppercase;letter-spacing:.5px;}
-    .meta-item .val{font-size:13px;font-weight:600;margin-top:2px;color:#1a1a2e;}
-    .score-box{background:linear-gradient(135deg,#f0f4ff,#e8f0ff);border:2px solid #4f8ef7;border-radius:10px;padding:16px 20px;margin-bottom:18px;display:flex;align-items:center;gap:16px;}
-    .score-big{font-size:44px;font-weight:800;color:#4f8ef7;line-height:1;}
-    .score-info h3{margin:0 0 4px;font-size:15px;}
-    .score-info p{margin:0;font-size:12px;color:#666;}
-    .comp-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:18px;}
-    .comp-card{background:#f9faff;border-radius:6px;padding:10px 12px;border-left:3px solid #4f8ef7;}
-    .comp-card .cname{font-size:11px;color:#555;margin-bottom:4px;}
-    .comp-card .cval{font-size:18px;font-weight:800;color:#4f8ef7;}
-    .comp-card .csub{font-size:10px;color:#999;margin-top:2px;}
-    table{width:100%;border-collapse:collapse;margin-bottom:14px;}
-    table th{background:#4f8ef7;color:#fff;padding:7px 8px;font-size:11px;text-align:left;}
-    .open-q{background:#f9faff;border-radius:6px;padding:10px 12px;margin-bottom:10px;}
-    .open-q .oq-label{font-size:10px;color:#4f8ef7;font-weight:700;text-transform:uppercase;margin-bottom:4px;}
-    .open-q .oq-q{font-size:12px;font-weight:600;margin-bottom:5px;color:#333;}
-    .open-q .oq-a{font-size:12px;color:#555;line-height:1.5;}
-    .section-divider{border:none;border-top:2px solid #eee;margin:20px 0;}
-    .respondente-badge{display:inline-block;padding:2px 8px;border-radius:20px;font-size:10px;font-weight:700;margin-bottom:6px;}
-    .rb-auto{background:#e6f9f4;color:#00b89c;}
-    .rb-sup{background:#e8f0ff;color:#4f8ef7;}
-    @media print{body{padding:15px;}button{display:none!important;}}
-  </style></head><body>
-  <div style="text-align:right;margin-bottom:10px;"><button onclick="window.print()" style="background:#4f8ef7;color:#fff;border:none;border-radius:6px;padding:8px 16px;font-size:13px;cursor:pointer;font-family:inherit;">🖨️ Imprimir / Salvar PDF</button></div>
-  <div class="header">
-    <h1>📊 Relatório de Avaliação 360°</h1>
-    <p>Gestão RH — Grupo JVM &nbsp;|&nbsp; Gerado em ${new Date().toLocaleDateString('pt-BR',{day:'2-digit',month:'long',year:'numeric'})}</p>
-  </div>
-
-  <div class="meta-grid">
-    <div class="meta-item"><div class="lbl">Colaborador</div><div class="val">${c.nome}</div></div>
-    <div class="meta-item"><div class="lbl">Cargo / Vaga</div><div class="val">${c.vaga||'—'}</div></div>
-    <div class="meta-item"><div class="lbl">Formação</div><div class="val">${c.formacao||'—'}</div></div>
-    <div class="meta-item"><div class="lbl">E-mail</div><div class="val">${c.email||'—'}</div></div>
-    <div class="meta-item"><div class="lbl">Localização</div><div class="val">${[c.cidade,c.estado].filter(Boolean).join(' — ')||'—'}</div></div>
-    <div class="meta-item"><div class="lbl">Status</div><div class="val">${c.status||'Em análise'}</div></div>
-  </div>
-
-  <div class="score-box">
-    <div class="score-big">${score??'—'}</div>
-    <div class="score-info">
-      <h3>Nota Final da Avaliação 360°</h3>
-      <p>Composição: 70% Supervisor + 30% Autoavaliação</p>
-      <p style="margin-top:4px;">Supervisor: <strong>${supScore?.toFixed(1)??'—'}/10</strong> &nbsp;|&nbsp; Autoavaliação: <strong>${autoScore?.toFixed(1)??'—'}/10</strong></p>
-    </div>
-  </div>
-
-  <h2>Pontuação por Competência</h2>
-  <div class="comp-grid">
-    ${lqs.map(q=>{
-      const a=compScore(autoA?.respostas,q.competencia);
-      const s=compScore(supA?.respostas,q.competencia);
-      const w=+(a*0.3+s*0.7).toFixed(1);
-      return `<div class="comp-card">
-        <div class="cname">${q.competencia}</div>
-        <div class="cval">${w}</div>
-        <div class="csub">Auto: ${a} | Sup: ${s}</div>
-      </div>`;
-    }).join('')}
-  </div>
-
-  <hr class="section-divider">
-  <h2>Respostas por Competência</h2>
-  ${lqs.map(q=>`
-    <h3>${q.competencia}</h3>
-    <table>
-      <thead><tr><th style="width:70%">Afirmação</th><th style="width:15%;text-align:center;">Autoaval.</th><th style="width:15%;text-align:center;">Supervisor</th></tr></thead>
-      <tbody>
-        ${q.items.map((item,ii)=>{
-          const av=autoA?.respostas?.[q.competencia]?.[ii];
-          const sv=supA?.respostas?.[q.competencia]?.[ii];
-          const fmt=v=>v===null||v===undefined?'—':(v===4?'Não Sei':LIKERT_LABELS[v]||'—');
-          return `<tr><td style="padding:5px 8px;font-size:12px;border-bottom:1px solid #eee;">${item}</td>
-            <td style="padding:5px 8px;font-size:12px;text-align:center;border-bottom:1px solid #eee;">${fmt(av)}</td>
-            <td style="padding:5px 8px;font-size:12px;text-align:center;border-bottom:1px solid #eee;font-weight:600;">${fmt(sv)}</td></tr>`;
-        }).join('')}
-      </tbody>
-    </table>`).join('')}
-
-  <hr class="section-divider">
-  <h2>Respostas Abertas</h2>
-  ${openQs.map(q=>`
-    ${autoA?.respostas?.[q.key]?`<div class="open-q">
-      <div class="respondente-badge rb-auto">Autoavaliação</div>
-      <div class="oq-q">${q.title}</div>
-      <div class="oq-a">${autoA.respostas[q.key]}</div>
-    </div>`:''}
-    ${supA?.respostas?.[q.key]?`<div class="open-q">
-      <div class="respondente-badge rb-sup">Supervisor</div>
-      <div class="oq-q">${q.title}</div>
-      <div class="oq-a">${supA.respostas[q.key]}</div>
-    </div>`:''}
-  `).join('')}
-
-  <hr class="section-divider">
-  <p style="text-align:center;font-size:11px;color:#999;margin-top:10px;">Relatório gerado pelo Gestão RH — Grupo JVM</p>
-  </body></html>`;
-
-  const win=window.open('','_blank','width=900,height=700');
-  win.document.write(html);
-  win.document.close();
-  // save reference in candidate history
-  const idx=candidates.findIndex(x=>x.id===id);
-  if(idx!==-1){
-    if(!candidates[idx].historico)candidates[idx].historico=[];
-    const already=candidates[idx].historico.some(h=>h.obs&&h.obs.includes('Relatório 360°'));
-    if(!already){
-      candidates[idx].historico.push({status:candidates[idx].status||'Em análise',data:new Date().toISOString(),obs:`📄 Relatório 360° gerado — Nota: ${score}/10 (Supervisor: ${supScore?.toFixed(1)}, Auto: ${autoScore?.toFixed(1)})`});
-      saveCandidates();
-    }
-  }
-  showToast('success','📄 Relatório aberto em nova janela!');
-}
-
-function generateLinks(id){
+async function generateLinks(id){
   const idx=candidates.findIndex(x=>x.id===id);if(idx===-1)return;
-  const gen=()=>Math.random().toString(36).substr(2,10)+'_'+id;
+  const gen=()=>Math.random().toString(36).substr(2,10)+'_'+id.split('-')[0];
   const ex=candidates[idx].assessments||[];
-  const autoA=ex.find(a=>a.tipo==='auto')||{tipo:'auto',token:gen(),respondido:false,respostas:null};
-  const supA=ex.find(a=>a.tipo==='supervisor')||{tipo:'supervisor',token:gen(),respondido:false,respostas:null};
-  if(!autoA.token)autoA.token=gen();
-  if(!supA.token)supA.token=gen();
-  candidates[idx].assessments=[autoA,supA];
-  saveCandidates();
-  showToast('success','🔗 Códigos gerados! Copie e envie para os avaliadores.');
-  switchTab('avaliacao');
+  const autoA=ex.find(a=>a.tipo==='auto');
+  const supA=ex.find(a=>a.tipo==='supervisor');
+  try{
+    if(!autoA){
+      await supa.post('/rest/v1/avaliacoes',{candidato_id:id,tipo:'auto',token:gen(),respondido:false});
+    }
+    if(!supA){
+      await supa.post('/rest/v1/avaliacoes',{candidato_id:id,tipo:'supervisor',token:gen(),respondido:false});
+    }
+    await loadCandidates();
+    showToast('success','🔗 Códigos gerados! Copie e envie para os avaliadores.');
+    switchTab('avaliacao');
+  } catch(e){showToast('error','❌ Erro ao gerar códigos');}
 }
-function resetAssessment(id){
+
+async function resetAssessment(id){
   if(!confirm('Resetar apagará todas as respostas. Confirma?'))return;
-  const idx=candidates.findIndex(x=>x.id===id);if(idx===-1)return;
-  candidates[idx].assessments=[];saveCandidates();switchTab('avaliacao');
-  showToast('success','Avaliação resetada.');
+  try{
+    const c=candidates.find(x=>x.id===id);
+    const ids=(c?.assessments||[]).map(a=>a.id).filter(Boolean);
+    if(ids.length){
+      await supa.delete(`/rest/v1/avaliacoes?candidato_id=eq.${id}`);
+    }
+    await loadCandidates();switchTab('avaliacao');
+    showToast('success','Avaliação resetada.');
+  } catch(e){showToast('error','❌ Erro ao resetar');}
 }
-function copyCode(code){
-  navigator.clipboard.writeText(code).then(()=>showToast('success','📋 Código copiado!')).catch(()=>window.prompt('Copie o código:',code));
-}
+
+function copyCode(code){navigator.clipboard.writeText(code).then(()=>showToast('success','📋 Código copiado!')).catch(()=>window.prompt('Copie o código:',code));}
 function openSurveyDirect(token){closeModal();startSurvey(token);}
 
 // ── EDIT TAB ──
@@ -1269,50 +1331,137 @@ function buildEdit(c){
     </div>
     <div class="edit-actions">
       <button class="btn btn-sm btn-outline" onclick="switchTab('perfil')">← Cancelar</button>
-      <button class="btn btn-primary btn-sm" onclick="saveEdit(${c.id})" style="width:auto;flex:1;">💾 Salvar</button>
+      <button class="btn btn-primary btn-sm" onclick="saveEdit('${c.id}')" style="width:auto;flex:1;">💾 Salvar</button>
     </div>
   </div>`;}
 function addEditSkill(){const inp=document.getElementById('edit-skill-inp');const v=inp.value.trim();if(v&&!editSkills.includes(v)){editSkills.push(v);renderEditSkills();}inp.value='';}
 function removeEditSkill(i){editSkills.splice(i,1);renderEditSkills();}
 function renderEditSkills(){document.getElementById('edit-skills-box').innerHTML=editSkills.map((s,i)=>`<span class="stag">${s}<span class="rm" onclick="removeEditSkill(${i})">×</span></span>`).join('');}
-function saveEdit(id){
+
+async function saveEdit(id){
   const nome=document.getElementById('e-nome').value.trim();if(!nome){showToast('error','⚠️ Nome obrigatório');return;}
   const contrato=Array.from(document.querySelectorAll('#e-cont input:checked')).map(i=>i.value);
-  const idx=candidates.findIndex(x=>x.id===id);if(idx===-1)return;
-  candidates[idx]={...candidates[idx],nome,email:document.getElementById('e-email').value.trim(),
-    nascimento:document.getElementById('e-nasc').value,sexo:document.getElementById('e-sexo').value,
-    estadoCivil:document.getElementById('e-ec').value,pcd:document.getElementById('e-pcd').value,
-    cnh:document.getElementById('e-cnh').value,linkedin:document.getElementById('e-li').value.trim(),
-    cidade:document.getElementById('e-cidade').value.trim(),estado:document.getElementById('e-estado').value,
-    formacao:document.getElementById('e-form').value.trim(),vaga:document.getElementById('e-vaga').value.trim(),
-    experiencia:document.getElementById('e-exp').value.trim(),skills:[...editSkills],contrato,updatedAt:new Date().toISOString()};
-  saveCandidates();renderCandidates();renderEstadoFilter();renderSkillFilters();
-  showToast('success','✅ Dados atualizados!');
-  document.querySelector('.modal-title h2').textContent=nome;switchTab('perfil');
+  const row={
+    nome, email:document.getElementById('e-email').value.trim()||null,
+    nascimento:document.getElementById('e-nasc').value||null,
+    sexo:document.getElementById('e-sexo').value||null,
+    estado_civil:document.getElementById('e-ec').value||null,
+    pcd:document.getElementById('e-pcd').value==='Sim',
+    cnh:document.getElementById('e-cnh').value,
+    linkedin:document.getElementById('e-li').value.trim()||null,
+    cidade:document.getElementById('e-cidade').value.trim()||null,
+    estado:document.getElementById('e-estado').value||null,
+    formacao:document.getElementById('e-form').value.trim()||null,
+    vaga_pretendida:document.getElementById('e-vaga').value.trim()||null,
+    experiencia:document.getElementById('e-exp').value.trim()||null,
+    skills:[...editSkills], tipo_contrato:contrato
+  };
+  try{
+    await supa.patch(`/rest/v1/candidatos?id=eq.${id}`,row);
+    await loadCandidates();
+    showToast('success','✅ Dados atualizados!');
+    document.querySelector('.modal-title h2').textContent=nome;
+    switchTab('perfil');
+  } catch(e){showToast('error','❌ Erro ao salvar edição');}
 }
 
-// ── PDF TAB ──
 function buildPdfTab(c){
-  if(!c.pdfDataUrl)return`<div style="text-align:center;padding:56px 20px;color:var(--text2);"><div style="font-size:44px;margin-bottom:12px;">📭</div><p style="font-weight:600;margin-bottom:5px;">Nenhum PDF disponível</p><p style="font-size:13px;">Este candidato foi cadastrado sem upload de PDF.</p></div>`;
-  return`<div><div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;"><span style="font-size:13px;color:var(--text2);">📎 Currículo original</span><a href="${c.pdfDataUrl}" download="${c.nome.replace(/ /g,'_')}_curriculo.pdf" class="btn btn-sm btn-outline" style="font-size:11px;text-decoration:none;">⬇ Baixar</a></div><iframe src="${c.pdfDataUrl}" style="width:100%;height:580px;border:none;border-radius:var(--rsm);background:#fff;"></iframe></div>`;}
+  if(!c.pdf_path){
+    return`<div style="text-align:center;padding:56px 20px;color:var(--text2);">
+      <div style="font-size:44px;margin-bottom:12px;">📭</div>
+      <p style="font-weight:600;margin-bottom:5px;">Nenhum PDF disponível</p>
+      <p style="font-size:13px;">Este candidato foi cadastrado sem upload de PDF.</p>
+    </div>`;
+  }
+  // Retorna placeholder e carrega URL de forma assíncrona
+  setTimeout(()=>loadPdfViewer(c),100);
+  return`<div id="pdf-viewer-wrap" style="text-align:center;padding:40px;color:var(--text2);">
+    <div style="font-size:32px;margin-bottom:10px;">⏳</div>
+    <p>Carregando PDF...</p>
+  </div>`;
+}
+
+async function loadPdfViewer(c){
+  const wrap=document.getElementById('pdf-viewer-wrap');
+  if(!wrap)return;
+  const url=await supa.getPDFUrl(c.pdf_path);
+  if(!url){
+    wrap.innerHTML=`<div style="font-size:44px;margin-bottom:12px;">❌</div><p style="font-weight:600;">Erro ao carregar PDF</p>`;
+    return;
+  }
+  wrap.innerHTML=`
+    <div>
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
+        <span style="font-size:13px;color:var(--text2);">📎 Currículo original</span>
+        <a href="${url}" target="_blank" class="btn btn-sm btn-outline" style="font-size:11px;text-decoration:none;">⬇ Baixar</a>
+      </div>
+      <iframe src="${url}" style="width:100%;height:580px;border:none;border-radius:var(--rsm);background:#fff;"></iframe>
+    </div>`;
+}
 
 // ── DELETE ──
-function deleteCandidate(id){
+async function deleteCandidate(id){
   if(!confirm('Excluir este candidato permanentemente?'))return;
-  candidates=candidates.filter(c=>c.id!==id);saveCandidates();
-  closeModal();renderCandidates();renderEstadoFilter();renderSkillFilters();
-  showToast('success','🗑 Candidato removido');
+  try{
+    await supa.delete(`/rest/v1/candidatos?id=eq.${id}`);
+    await loadCandidates();
+    closeModal();renderCandidates();renderEstadoFilter();renderSkillFilters();
+    showToast('success','🗑 Candidato removido');
+  } catch(e){showToast('error','❌ Erro ao excluir candidato');}
+}
+
+// ── GENERATE REPORT ──
+function generateReport(id){
+  const c=candidates.find(x=>x.id===id);if(!c)return;
+  const autoA=c.assessments?.find(a=>a.tipo==='auto');
+  const supA=c.assessments?.find(a=>a.tipo==='supervisor');
+  const score=calcCandidateScore(c);
+  const autoScore=autoA?.respostas?calcLikertScore(autoA.respostas):null;
+  const supScore=supA?.respostas?calcLikertScore(supA.respostas):null;
+  const lqs=SURVEY_QUESTIONS.filter(q=>q.type==='likert');
+  const openQs=SURVEY_QUESTIONS.filter(q=>q.type==='open');
+  const compScore=(resp,comp)=>{const vals=(resp?.[comp]||[]).filter(v=>v!==null&&v!==undefined&&v!==4);return vals.length?+(vals.reduce((a,b)=>a+b,0)/vals.length*(10/3)).toFixed(1):0;};
+  const html=`<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8"><title>Relatório 360° — ${c.nome}</title>
+  <style>body{font-family:'Segoe UI',Arial,sans-serif;margin:0;padding:30px;color:#1a1a2e;font-size:13px;}h1{font-size:22px;font-weight:800;margin-bottom:4px;}h2{font-size:15px;font-weight:700;margin:20px 0 8px;color:#0a0e1a;border-left:4px solid #4f8ef7;padding-left:8px;}h3{font-size:13px;font-weight:700;margin:14px 0 6px;}.header{background:linear-gradient(135deg,#4f8ef7,#7c5cfc);color:#fff;padding:20px 24px;border-radius:10px;margin-bottom:20px;}.header h1{color:#fff;margin-bottom:3px;}.header p{font-size:12px;opacity:.85;margin:0;}.meta-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:18px;}.meta-item{background:#f5f7ff;border-radius:6px;padding:8px 12px;}.meta-item .lbl{font-size:10px;color:#666;text-transform:uppercase;}.meta-item .val{font-size:13px;font-weight:600;margin-top:2px;}.score-box{background:linear-gradient(135deg,#f0f4ff,#e8f0ff);border:2px solid #4f8ef7;border-radius:10px;padding:16px 20px;margin-bottom:18px;display:flex;align-items:center;gap:16px;}.score-big{font-size:44px;font-weight:800;color:#4f8ef7;line-height:1;}.comp-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:18px;}.comp-card{background:#f9faff;border-radius:6px;padding:10px 12px;border-left:3px solid #4f8ef7;}.comp-card .cname{font-size:11px;color:#555;margin-bottom:4px;}.comp-card .cval{font-size:18px;font-weight:800;color:#4f8ef7;}.comp-card .csub{font-size:10px;color:#999;margin-top:2px;}table{width:100%;border-collapse:collapse;margin-bottom:14px;}table th{background:#4f8ef7;color:#fff;padding:7px 8px;font-size:11px;text-align:left;}.open-q{background:#f9faff;border-radius:6px;padding:10px 12px;margin-bottom:10px;}.oq-label{font-size:10px;color:#4f8ef7;font-weight:700;text-transform:uppercase;margin-bottom:4px;}.oq-q{font-size:12px;font-weight:600;margin-bottom:5px;color:#333;}.oq-a{font-size:12px;color:#555;line-height:1.5;}hr{border:none;border-top:2px solid #eee;margin:20px 0;}@media print{button{display:none!important;}}</style></head><body>
+  <div style="text-align:right;margin-bottom:10px;"><button onclick="window.print()" style="background:#4f8ef7;color:#fff;border:none;border-radius:6px;padding:8px 16px;font-size:13px;cursor:pointer;">🖨️ Imprimir / Salvar PDF</button></div>
+  <div class="header"><h1>📊 Relatório de Avaliação 360°</h1><p>Gestão RH — Grupo JVM &nbsp;|&nbsp; Gerado em ${new Date().toLocaleDateString('pt-BR',{day:'2-digit',month:'long',year:'numeric'})}</p></div>
+  <div class="meta-grid">
+    <div class="meta-item"><div class="lbl">Colaborador</div><div class="val">${c.nome}</div></div>
+    <div class="meta-item"><div class="lbl">Cargo / Vaga</div><div class="val">${c.vaga||'—'}</div></div>
+    <div class="meta-item"><div class="lbl">Formação</div><div class="val">${c.formacao||'—'}</div></div>
+    <div class="meta-item"><div class="lbl">E-mail</div><div class="val">${c.email||'—'}</div></div>
+    <div class="meta-item"><div class="lbl">Localização</div><div class="val">${[c.cidade,c.estado].filter(Boolean).join(' — ')||'—'}</div></div>
+    <div class="meta-item"><div class="lbl">Status</div><div class="val">${c.status||'—'}</div></div>
+  </div>
+  <div class="score-box"><div class="score-big">${score??'—'}</div><div><h3 style="margin:0 0 4px;">Nota Final da Avaliação 360°</h3><p style="margin:0;font-size:12px;color:#666;">70% Supervisor + 30% Autoavaliação</p><p style="margin:4px 0 0;font-size:12px;">Supervisor: <strong>${supScore?.toFixed(1)??'—'}/10</strong> &nbsp;|&nbsp; Auto: <strong>${autoScore?.toFixed(1)??'—'}/10</strong></p></div></div>
+  <h2>Pontuação por Competência</h2>
+  <div class="comp-grid">${lqs.map(q=>{const a=compScore(autoA?.respostas,q.competencia);const s=compScore(supA?.respostas,q.competencia);const w=+(a*0.3+s*0.7).toFixed(1);return`<div class="comp-card"><div class="cname">${q.competencia}</div><div class="cval">${w}</div><div class="csub">Auto: ${a} | Sup: ${s}</div></div>`;}).join('')}</div>
+  <hr>
+  <h2>Respostas por Competência</h2>
+  ${lqs.map(q=>`<h3>${q.competencia}</h3><table><thead><tr><th style="width:66%">Afirmação</th><th style="width:17%;text-align:center;">Autoaval.</th><th style="width:17%;text-align:center;">Supervisor</th></tr></thead><tbody>
+    ${q.items.map((item,ii)=>{const av=autoA?.respostas?.[q.competencia]?.[ii];const sv=supA?.respostas?.[q.competencia]?.[ii];const fmt=v=>v===null||v===undefined?'—':(v===4?'Não Sei':LIKERT_LABELS[v]||'—');return`<tr><td style="padding:5px 8px;font-size:12px;border-bottom:1px solid #eee;">${item}</td><td style="padding:5px 8px;font-size:12px;text-align:center;border-bottom:1px solid #eee;">${fmt(av)}</td><td style="padding:5px 8px;font-size:12px;text-align:center;border-bottom:1px solid #eee;font-weight:600;">${fmt(sv)}</td></tr>`;}).join('')}
+  </tbody></table>`).join('')}
+  <hr>
+  <h2>Respostas Abertas</h2>
+  ${openQs.map(q=>`
+    ${autoA?.respostas?.[q.key]?`<div class="open-q"><div class="oq-label">Autoavaliação</div><div class="oq-q">${q.title}</div><div class="oq-a">${autoA.respostas[q.key]}</div></div>`:''}
+    ${supA?.respostas?.[q.key]?`<div class="open-q"><div class="oq-label" style="color:#f5a623;">Supervisor</div><div class="oq-q">${q.title}</div><div class="oq-a">${supA.respostas[q.key]}</div></div>`:''}`).join('')}
+  <hr><p style="text-align:center;font-size:11px;color:#999;">Relatório gerado pelo Gestão RH — Grupo JVM</p>
+  </body></html>`;
+  const win=window.open('','_blank','width=900,height=700');
+  win.document.write(html);win.document.close();
+  showToast('success','📄 Relatório aberto em nova janela!');
 }
 
 // ══════════════════════════════════════════
-// SURVEY OVERLAY
+// SURVEY OVERLAY — formulário avaliação
 // ══════════════════════════════════════════
 function showSurveyOverlay(){document.getElementById('survey-overlay').style.display='flex';document.body.style.overflow='hidden';}
 function hideSurveyOverlay(){document.getElementById('survey-overlay').style.display='none';document.body.style.overflow='';}
 
 function openSurveyAccess(){
   document.getElementById('survey-card').innerHTML=`
-    <div class="sv-topbar"><h2>🎯 Avaliação de Perfil 360°</h2><p>Gestão RH — Formulário de Avaliação Profissional</p></div>
+    <div class="sv-topbar"><h2>🎯 Avaliação de Perfil 360°</h2><p>Gestão RH — Grupo JVM</p></div>
     <div class="access-screen">
       <div class="ac-icon">🔑</div>
       <h3 style="font-size:19px;font-weight:700;margin-bottom:7px;">Insira seu Código de Avaliação</h3>
@@ -1329,23 +1478,32 @@ function openSurveyAccess(){
   setTimeout(()=>document.getElementById('sv-code')?.focus(),150);
 }
 
-function submitCode(){
+async function submitCode(){
   const code=(document.getElementById('sv-code')?.value||'').trim();if(!code)return;
-  loadCandidates();
-  for(const c of candidates){const a=c.assessments?.find(a=>a.token===code);if(a){startSurvey(code);return;}}
+  try{
+    const rows=await supa.post('/rest/v1/rpc/buscar_avaliacao_por_token',{p_token:code});
+    if(rows&&rows.length>0){startSurvey(code);return;}
+  } catch(e){console.error(e);}
   document.getElementById('sv-code-err').style.display='block';
 }
 
-function startSurvey(token){
-  loadCandidates();
+async function startSurvey(token){
   let foundC=null,foundA=null;
-  for(const c of candidates){const a=c.assessments?.find(a=>a.token===token);if(a){foundC=c;foundA=a;break;}}
+  try{
+    // Usa RPC segura (funciona para anon sem login)
+    const rows=await supa.post('/rest/v1/rpc/buscar_avaliacao_por_token',{p_token:token});
+    if(!rows||!rows.length){showToast('error','Código inválido.');return;}
+    const row=rows[0];
+    foundA={id:row.id,candidato_id:row.candidato_id,tipo:row.tipo,token:row.token,respondido:row.respondido};
+    foundC={id:row.candidato_id,nome:row.candidato_nome};
+  } catch(e){showToast('error','Erro ao carregar avaliação.');return;}
+
   if(!foundC||!foundA){showToast('error','Código inválido.');return;}
   if(foundA.respondido){
     document.getElementById('survey-card').innerHTML=`<div class="survey-done"><div class="sd-icon">✅</div><h3 style="font-size:19px;font-weight:700;margin-bottom:7px;">Já respondida!</h3><p style="color:var(--text2);">A avaliação de <strong>${foundC.nome}</strong> já foi concluída.<br>Obrigado pela participação!</p><button class="btn btn-sm btn-outline" style="margin-top:18px;" onclick="hideSurveyOverlay()">Fechar</button></div>`;
     showSurveyOverlay();return;
   }
-  surveyState={qIdx:0,respostas:{},candidateId:foundC.id,token,tipo:foundA.tipo};
+  surveyState={qIdx:0,respostas:{},candidateId:foundA.candidato_id,avaliacaoId:foundA.id,token,tipo:foundA.tipo,nomeCand:foundC.nome};
   showSurveyOverlay();renderSurveyQ();
 }
 
@@ -1354,9 +1512,6 @@ function renderSurveyQ(){
   const total=SURVEY_QUESTIONS.length;
   const pct=Math.round((surveyState.qIdx/total)*100);
   const lbl=surveyState.tipo==='auto'?'Autoavaliação (30%)':'Avaliação Supervisor (70%)';
-  loadCandidates();
-  const c=candidates.find(x=>x.id===surveyState.candidateId);
-  const nome=c?c.nome:'Colaborador';
   let body='';
   if(q.type==='likert'){
     body=`<p class="q-title">${q.title}</p>
@@ -1368,11 +1523,10 @@ function renderSurveyQ(){
       </tr>`).join('')}</tbody>
     </table></div>`;
   } else {
-    body=`<p class="q-title">${q.title}</p>
-    <textarea id="open-ans" rows="5" placeholder="Escreva sua resposta aqui...">${surveyState.respostas[q.key]||''}</textarea>`;
+    body=`<p class="q-title">${q.title}</p><textarea id="open-ans" rows="5" placeholder="Escreva sua resposta aqui...">${surveyState.respostas[q.key]||''}</textarea>`;
   }
   document.getElementById('survey-card').innerHTML=`
-    <div class="sv-topbar"><h2 style="font-size:15px;">${lbl} — ${nome}</h2><p>Avaliação de Perfil Profissional 360°</p></div>
+    <div class="sv-topbar"><h2 style="font-size:15px;">${lbl} — ${surveyState.nomeCand||'Colaborador'}</h2><p>Gestão RH — Grupo JVM</p></div>
     <div class="sv-prog">
       <span style="font-size:11px;color:var(--text2);flex-shrink:0;">Q ${surveyState.qIdx+1}/${total}</span>
       <div class="sv-pbar"><div class="sv-pfill" style="width:${pct}%"></div></div>
@@ -1383,9 +1537,7 @@ function renderSurveyQ(){
       <button class="btn btn-sm btn-outline" onclick="hideSurveyOverlay()" style="font-size:11px;">✕ Fechar</button>
       <div style="display:flex;gap:8px;">
         ${surveyState.qIdx>0?`<button class="btn btn-sm btn-outline" onclick="surveyPrev()">← Anterior</button>`:''}
-        <button class="btn btn-sm btn-primary" style="width:auto;" onclick="surveyNext()">
-          ${surveyState.qIdx===total-1?'Enviar Avaliação ✓':'Próxima →'}
-        </button>
+        <button class="btn btn-sm btn-primary" style="width:auto;" onclick="surveyNext()">${surveyState.qIdx===total-1?'Enviar Avaliação ✓':'Próxima →'}</button>
       </div>
     </div>`;}
 
@@ -1399,28 +1551,49 @@ function saveCurrentQ(){
   } else {const ta=document.getElementById('open-ans');if(ta)surveyState.respostas[q.key]=ta.value.trim();}
 }
 function surveyPrev(){saveCurrentQ();surveyState.qIdx--;renderSurveyQ();}
-function surveyNext(){
-  saveCurrentQ();
-  if(surveyState.qIdx<SURVEY_QUESTIONS.length-1){surveyState.qIdx++;renderSurveyQ();}
-  else submitSurvey();
+function surveyNext(){saveCurrentQ();if(surveyState.qIdx<SURVEY_QUESTIONS.length-1){surveyState.qIdx++;renderSurveyQ();}else submitSurvey();}
+
+async function submitSurvey(){
+  // Calcula nota
+  const lkRespostas = {};
+  SURVEY_QUESTIONS.filter(q=>q.type==='likert').forEach(q=>{lkRespostas[q.competencia]=surveyState.respostas[q.competencia]||[];});
+  const nota = calcLikertScore(lkRespostas);
+
+  try{
+    // 1. Salva respostas likert
+    const likertRows=[];
+    SURVEY_QUESTIONS.filter(q=>q.type==='likert').forEach(q=>{
+      (surveyState.respostas[q.competencia]||[]).forEach((val,ii)=>{
+        likertRows.push({avaliacao_id:surveyState.avaliacaoId,competencia:q.competencia,item_index:ii,item_texto:q.items[ii],valor:val===4||val===null?null:val});
+      });
+    });
+    if(likertRows.length) await supa.post('/rest/v1/respostas_likert',likertRows);
+
+    // 2. Salva respostas abertas
+    const abertasRows=[];
+    SURVEY_QUESTIONS.filter(q=>q.type==='open').forEach(q=>{
+      if(surveyState.respostas[q.key]) abertasRows.push({avaliacao_id:surveyState.avaliacaoId,chave:q.key,pergunta:q.title,resposta:surveyState.respostas[q.key]});
+    });
+    if(abertasRows.length) await supa.post('/rest/v1/respostas_abertas',abertasRows);
+
+    // 3. Marca avaliação como respondida + nota
+    await supa.patch(`/rest/v1/avaliacoes?id=eq.${surveyState.avaliacaoId}`,{respondido:true,data_resposta:new Date().toISOString(),nota});
+
+    // 4. Trigger DB recalcula nota_avaliacao automaticamente
+    document.getElementById('survey-card').innerHTML=`
+      <div class="survey-done">
+        <div class="sd-icon">🎉</div>
+        <h3 style="font-size:20px;font-weight:700;margin-bottom:7px;">Avaliação Enviada!</h3>
+        <p style="color:var(--text2);font-size:14px;line-height:1.5;">Suas respostas foram registradas com sucesso.<br>Obrigado por avaliar <strong>${surveyState.nomeCand}</strong>!</p>
+        <button class="btn btn-sm btn-outline" style="margin-top:22px;" onclick="hideSurveyOverlay()">← Fechar</button>
+      </div>`;
+    // Recarrega candidatos em background
+    loadCandidates().then(()=>{renderCandidates();renderEstadoFilter();renderSkillFilters();});
+  } catch(e){
+    console.error(e);
+    showToast('error','❌ Erro ao enviar avaliação. Tente novamente.');
+  }
 }
-function submitSurvey(){
-  loadCandidates();
-  const idx=candidates.findIndex(x=>x.id===surveyState.candidateId);if(idx===-1)return;
-  const aIdx=candidates[idx].assessments?.findIndex(a=>a.token===surveyState.token);
-  if(aIdx==null||aIdx===-1)return;
-  candidates[idx].assessments[aIdx].respondido=true;
-  candidates[idx].assessments[aIdx].respostas={...surveyState.respostas};
-  candidates[idx].assessments[aIdx].dataResposta=new Date().toISOString();
-  saveCandidates();
-  const nome=candidates[idx].nome;
-  document.getElementById('survey-card').innerHTML=`
-    <div class="survey-done">
-      <div class="sd-icon">🎉</div>
-      <h3 style="font-size:20px;font-weight:700;margin-bottom:7px;">Avaliação Enviada!</h3>
-      <p style="color:var(--text2);font-size:14px;line-height:1.5;">Suas respostas foram registradas com sucesso.<br>Obrigado por avaliar <strong>${nome}</strong>!</p>
-      <button class="btn btn-sm btn-outline" style="margin-top:22px;" onclick="hideSurveyOverlay()">← Fechar</button>
-    </div>`;}
 
 // ══════════════════════════════════════════
 // TOAST
@@ -1429,26 +1602,21 @@ function showToast(type,msg){
   const t=document.getElementById('toast');
   document.getElementById('toast-text').textContent=msg;
   t.className=`toast ${type}`;t.classList.add('show');
-  clearTimeout(window._tt);window._tt=setTimeout(()=>t.classList.remove('show'),3500);
+  clearTimeout(window._tt);window._tt=setTimeout(()=>t.classList.remove('show'),4000);
 }
 
 // ══════════════════════════════════════════
-// DEMO DATA
+// INIT — adicionar RPC de autenticação ao SQL
 // ══════════════════════════════════════════
-function seedDemo(){
-  // Demo assessment with full responses for Ana Paula
-  const autoResp={'Gestão do Desempenho':[2,1,2,2,2,2],'Comunicação':[2,2,2,2,1,2],'Planejamento e Organização':[2,2,1,2,2,2],'Criatividade e Inovação':[2,2,2,1,2,2],pontosFortes:'Excelente domínio técnico e capacidade de comunicação.',areasDesenv:'Poderia melhorar a gestão do tempo em situações de alta demanda.',impacto:'Impacto muito positivo, referência técnica para a equipe.'};
-  const supResp={'Gestão do Desempenho':[3,2,3,3,2,3],'Comunicação':[3,3,2,3,2,3],'Planejamento e Organização':[3,3,2,3,2,3],'Criatividade e Inovação':[3,3,3,2,2,3],pontosFortes:'Profissional excepcional, entrega consistente e alta qualidade.',areasDesenv:'Liderança de equipes maiores pode ser desenvolvida.',impacto:'Um dos melhores membros da equipe, aumentou produtividade em 30%.'};
-  candidates=[
-    {id:1,nome:'Ana Paula Ferreira',email:'ana.paula@email.com',nascimento:'1995-03-15',sexo:'Feminino',estadoCivil:'Casado(a)',pcd:'Não',cnh:'B',linkedin:'https://linkedin.com/in/anapaula',cidade:'São Paulo',estado:'SP',formacao:'Ciência da Computação',vaga:'Desenvolvedora Frontend',experiencia:'TechCorp (2020–2023): React e TypeScript.\nStartupX (2023–presente): Design system.',skills:['React','TypeScript','CSS','Figma','Node.js'],contrato:['CLT','PJ'],status:'Contratado',historico:[{status:'Em análise',data:'2024-01-10T00:00:00.000Z',obs:'Cadastro inicial.'},{status:'Contratado',data:'2024-02-01T00:00:00.000Z',obs:'Contratada como Dev Sênior. Salário R$ 8.500.'}],assessments:[{tipo:'auto',token:'demo_auto_1',respondido:true,respostas:autoResp,dataResposta:'2024-06-01T00:00:00.000Z'},{tipo:'supervisor',token:'demo_sup_1',respondido:true,respostas:supResp,dataResposta:'2024-06-02T00:00:00.000Z'}],createdAt:'2024-01-10T00:00:00.000Z',pdfDataUrl:null},
-    {id:2,nome:'Carlos Eduardo Lima',email:'carlos.lima@email.com',nascimento:'1990-07-22',sexo:'Masculino',estadoCivil:'Solteiro(a)',pcd:'Não',cnh:'AB',linkedin:'',cidade:'Curitiba',estado:'PR',formacao:'Engenharia de Software',vaga:'Engenheiro Backend',experiencia:'Banco Digital (2018–2022): APIs REST Java.\nFintech (2022–presente): Microserviços cloud.',skills:['Java','Spring Boot','Docker','Kubernetes','AWS'],contrato:['CLT'],status:'Em análise',historico:[{status:'Em análise',data:'2024-03-05T00:00:00.000Z',obs:'Cadastro recebido.'}],assessments:[],createdAt:'2024-03-05T00:00:00.000Z',pdfDataUrl:null},
-    {id:3,nome:'Juliana Matos',email:'juliana.matos@email.com',nascimento:'1998-11-08',sexo:'Feminino',estadoCivil:'Solteiro(a)',pcd:'Sim',cnh:'Não possui',linkedin:'https://linkedin.com/in/julianamatos',cidade:'Salvador',estado:'BA',formacao:'Design Gráfico',vaga:'Designer UX/UI',experiencia:'Agência Criativa (2021–2023): UX e branding.\nFreelancer (2023–presente): Apps mobile.',skills:['Figma','Adobe XD','Illustrator','Photoshop','Prototipagem'],contrato:['CLT','Freelancer'],status:'Em análise',historico:[{status:'Em análise',data:'2024-03-15T00:00:00.000Z',obs:'Cadastro inicial.'}],assessments:[],createdAt:'2024-03-15T00:00:00.000Z',pdfDataUrl:null},
-    {id:4,nome:'Roberto Nascimento',email:'roberto.nasc@email.com',nascimento:'1993-05-30',sexo:'Masculino',estadoCivil:'Divorciado(a)',pcd:'Não',cnh:'B',linkedin:'',cidade:'Recife',estado:'PE',formacao:'Análise de Sistemas',vaga:'Analista de Dados',experiencia:'Consultoria Analytics (2019–presente): Power BI, Python e SQL.',skills:['Python','SQL','Power BI','Excel','Pandas','ML'],contrato:['CLT','Temporário'],status:'Desligado',historico:[{status:'Em análise',data:'2023-06-01T00:00:00.000Z',obs:'Cadastro inicial.'},{status:'Contratado',data:'2023-07-01T00:00:00.000Z',obs:'Contratado temporariamente.'},{status:'Desligado',data:'2024-01-31T00:00:00.000Z',obs:'Término do contrato.'}],assessments:[],createdAt:'2023-06-01T00:00:00.000Z',pdfDataUrl:null},
-    {id:5,nome:'Fernanda Costa',email:'fernanda.costa@email.com',nascimento:'2001-09-14',sexo:'Feminino',estadoCivil:'Solteiro(a)',pcd:'Não',cnh:'Não possui',linkedin:'https://linkedin.com/in/fernandacosta',cidade:'Belo Horizonte',estado:'MG',formacao:'Cursando Administração',vaga:'Estagiária de Marketing',experiencia:'Projeto universitário de marketing digital (2023).',skills:['Excel','Canva','Instagram','Google Ads','Copywriting'],contrato:['Estágio'],status:'Em análise',historico:[{status:'Em análise',data:'2024-04-10T00:00:00.000Z',obs:'Cadastro inicial.'}],assessments:[],createdAt:'2024-04-10T00:00:00.000Z',pdfDataUrl:null}
-  ];
-  saveCandidates();
-}
-if(candidates.length===0)seedDemo();
+// Nota: adicione esta função ao Supabase SQL antes de usar o login:
+// CREATE OR REPLACE FUNCTION autenticar_usuario(p_username TEXT, p_senha TEXT)
+// RETURNS TABLE(id UUID, username TEXT, nome_exibicao TEXT, role TEXT) AS $$
+// BEGIN
+//   RETURN QUERY SELECT u.id, u.username, u.nome_exibicao, u.role
+//   FROM usuarios u WHERE u.username = p_username AND u.ativo = TRUE
+//   AND crypt(p_senha, u.senha_hash) = u.senha_hash;
+// END;
+// $$ LANGUAGE plpgsql SECURITY DEFINER;
 </script>
 </body>
 </html>
