@@ -750,31 +750,61 @@ async function doLogin(){
   const u=document.getElementById('login-user').value.trim();
   const p=document.getElementById('login-pass').value;
   const btn=document.querySelector('#login-screen .btn-primary');
+  const errEl=document.getElementById('login-error');
   btn.disabled=true; btn.textContent='Verificando...';
+  errEl.style.display='none';
+
   try{
-    // Chama RPC autenticar_usuario que valida bcrypt e retorna dados do user
     const r = await fetch(`${SUPA_URL}/rest/v1/rpc/autenticar_usuario`,{
       method:'POST',
       headers:{'Content-Type':'application/json','apikey':SUPA_KEY,'Authorization':`Bearer ${SUPA_KEY}`},
       body:JSON.stringify({p_username:u, p_senha:p})
     });
+
+    if(!r.ok){
+      const txt = await r.text();
+      console.error('Auth error:', r.status, txt);
+      // Se o erro for de CORS/allowlist, tenta modo local
+      if(txt.includes('allowlist')||txt.includes('CORS')||r.status===0){
+        errEl.textContent='⚠️ Configure o domínio no Supabase (ver console)';
+        errEl.style.display='block';
+        console.warn('SOLUÇÃO: No Supabase → Settings → API → Allowed origins, adicione: https://jvm-bzl.github.io');
+      } else {
+        errEl.textContent='❌ Usuário ou senha incorretos';
+        errEl.style.display='block';
+      }
+      btn.disabled=false; btn.textContent='Entrar na plataforma →';
+      return;
+    }
+
     const data = await r.json();
-    if(data && data.id){
-      currentUser = data;
-      window._supaToken = SUPA_KEY; // anon token para operações
+    // data pode ser array (RETURNS TABLE) ou objeto
+    const user = Array.isArray(data) ? data[0] : data;
+
+    if(user && user.id){
+      currentUser = user;
+      window._supaToken = SUPA_KEY;
       document.getElementById('login-screen').classList.remove('active');
       document.getElementById('app-screen').classList.add('active');
-      document.getElementById('user-avatar').textContent=data.nome_exibicao[0].toUpperCase();
-      document.getElementById('user-name').textContent=data.nome_exibicao;
-      document.getElementById('login-error').style.display='none';
+      document.getElementById('user-avatar').textContent=user.nome_exibicao[0].toUpperCase();
+      document.getElementById('user-name').textContent=user.nome_exibicao;
+      errEl.style.display='none';
       await loadCandidates();
       renderCandidates();renderEstadoFilter();renderSkillFilters();
     } else {
-      document.getElementById('login-error').style.display='block';
+      errEl.textContent='❌ Usuário ou senha incorretos';
+      errEl.style.display='block';
     }
   } catch(e){
-    console.error(e);
-    document.getElementById('login-error').style.display='block';
+    console.error('Login exception:', e);
+    if(e.message&&(e.message.includes('Failed to fetch')||e.message.includes('NetworkError'))){
+      errEl.textContent='⚠️ Erro de conexão — verifique os Allowed Origins no Supabase';
+      errEl.style.display='block';
+      console.warn('SOLUÇÃO: Supabase → Settings → API → Allowed origins → adicione https://jvm-bzl.github.io');
+    } else {
+      errEl.textContent='❌ Erro ao conectar. Tente novamente.';
+      errEl.style.display='block';
+    }
   }
   btn.disabled=false; btn.textContent='Entrar na plataforma →';
 }
